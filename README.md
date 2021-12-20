@@ -1,7 +1,8 @@
 See main branch for overall project goal and approach.
 
 This tuitet-patch-1 branch contains:
-- Main PDF Written Report: Tim-Tuite-Bayes-Project-Report.pdf 
+
+- Main PDF Written Report: Tim-Tuite-Bayes-Project-Report.pdf
 - Quarterback Statistics Inference: Tim-Tuite-Bayes-Project-QB.Rmd
 - Running Back Statistics Inference: Tim-Tuite-Bayes-Project-RB.Rmd
 - Receiver Statistics Inference: Tim-Tuite-Bayes-Project-WR-TE.Rmd

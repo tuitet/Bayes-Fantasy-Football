@@ -1,5 +1,5 @@
-# bayes-fantasy-football
-Bayesian prediction of fantasy football statistics 
+# Bayes-Linear-Regression-Fantasy-Football
+## Bayesian prediction of fantasy football statistics 
 
 In this project, we are predicting which players will perform best in a fantasy football season based on certain underlying statistics.  
 

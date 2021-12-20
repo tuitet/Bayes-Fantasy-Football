@@ -1,9 +1,8 @@
-# Bayes-Linear-Regression-Fantasy-Football
-## Bayesian prediction of fantasy football statistics 
+# Bayesian Inference of Fantasy Football Statistics 
 
-In this project, we are predicting which players will perform best in a fantasy football season based on certain underlying statistics.  
+In this project, we will infer which underlying statistics best predict fantasy football player performance.
 
-The dataset we use is an amalgamation of two sets of statistics:  ”Next Gen Stats” powered by AWS andPro Football Reference. The Next Gen Stats has underlying statistics about football players from the 2019 season, while Pro Football Reference has Fantasy Points statistics.
+The dataset we use is a combination of two sets of fantasy football statistics: Next Gen Stats and Pro Football Reference. The Next Gen Stats has underlying statistics about football players from the 2019 season, while Pro Football Reference has Fantasy Points statistics.
 
 The  goal  of  this  analysis  is  to  determine  which  and  to  what  degree  underlying  variables contribute to total fantasy points scored during the 2019 season. The deviance information criterion (DIC) will guide which models best explain the relationship between these underlying variables and total fantasy points.
 

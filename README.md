@@ -1,2 +1,3 @@
-# bayes-fantasy-football
-Bayesian prediction of fantasy football statistics 
+See main branch for overall project goal and approach.
+
+This file contains:

@@ -15,7 +15,7 @@ Pre-processing and merging data from multiple data sources:
 - cleansing, aligning, and merging imported datasets
 
 Bayesian inference on merged dataset:
-- performing variable selection using either simple methods or elastic net (with a threshold) or stochastic search variable selection
+- performing variable selection using either simple methods or elastic net (with a threshold for keeping important variables) or Bayesian stochastic search variable selection (SSVS)
 - proposing linear regression models using a combination of likelihood function and informative and non-informative priors
 - performing Gibbs sampling on the models to understand the relationship between explanatory variables and response variable
-- comparing models using DIC  
+- comparing models using DIC

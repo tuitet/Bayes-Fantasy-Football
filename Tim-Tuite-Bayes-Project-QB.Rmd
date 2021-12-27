@@ -1,0 +1,649 @@
+---
+title: "Tim-Tuite-Bayes-Project-QB"
+output: html_document
+---
+
+The dataset itself will be pulled can be found here:  
+https://nextgenstats.nfl.com/stats/passing#yards
+
+Statistics definitions:
+https://nextgenstats.nfl.com/glossary
+
+
+```{r load packages, message = FALSE, include = FALSE}
+
+#install packages if needed
+if(!require(tidyverse)) install.packages('tidyverse') 
+library(tidyverse)
+if(!require(data.table)) install.packages('data.table')
+library(data.table)
+if(!require(XML)) install.packages('XML')
+library(XML)
+if(!require(DAAG)) install.packages('DAAG') 
+library(DAAG)
+if(!require(glmnet)) install.packages('glmnet') 
+library(glmnet)
+if(!require(outliers)) install.packages('outliers')
+library(outliers)
+if(!require(plyr)) install.packages('plyr')
+library(plyr)
+if(!require(RCurl)) install.packages('RCurl')
+library(RCurl)
+if(!require(rvest)) install.packages('rvest')
+library(rvest)
+if(!require(GGally)) install.packages('GGally')
+library(GGally)
+if(!require(magrittr)) install.packages('magrittr')
+library(magrittr)
+if(!require(broom)) install.packages('broom')
+library(broom)
+if(!require(rjags)) install.packages('rjags')
+library(rjags)
+if(!require(vctrs)) install.packages('vctrs') 
+library(vctrs)
+if(!require(devtools)) install.packages('devtools')
+
+library(devtools)
+install_github("willdebras/profootballref")
+
+if(!require(Rlab)) install.packages('Rlab')
+library(Rlab)
+if(!require(tidybayes)) install.packages('tidybayes')
+library(tidybayes)
+
+```
+
+
+
+*******************************************************************************************************************************
+  
+The first thing we need to do is to import the data. 
+```{r load real next gen stats data}
+
+#scrape 2019 next gen data from github, separated by position: #https://github.com/mrcaseb/nfl-data/tree/master/data/ngs
+#Examples of NFL data sources:
+#https://rpubs.com/Nate_Bean/660747
+#next_gen_2019_qb <- read_csv("https://raw.githubusercontent.com/mrcaseb/nfl-data/master/data/ngs/ngs_2019_passing.csv.gz")
+#in case the above can't be retrieved:
+next_gen_2019_qb <- read.csv("ngs_2019_passing.csv")
+next_gen_2019_qb$Player_Name <- paste(next_gen_2019_qb$player_first_name, next_gen_2019_qb$player_last_name)
+next_gen_2019_qb$Player_Name <- gsub(' ', '', next_gen_2019_qb$Player_Name)
+
+#detach(package:plyr) #plyr causes issues with the groupby https://stackoverflow.com/questions/26923862/why-are-my-dplyr-group-by-summarize-not-working-properly-name-collision-with
+#the current data is split by week...group to get the averages by player
+next_gen_2019_qb_grouped <- next_gen_2019_qb %>% 
+  filter(season_type == "REG") %>%
+  filter(week > 0 | week <= 17) %>% 
+  group_by(Player_Name) %>%
+  summarise_at(vars(avg_time_to_throw, avg_completed_air_yards, avg_intended_air_yards, avg_air_yards_differential, aggressiveness, max_completed_air_distance, avg_air_yards_to_sticks, attempts, pass_yards, pass_touchdowns, interceptions, passer_rating, completions, completion_percentage, expected_completion_percentage, avg_air_distance, max_air_distance), mean) %>%
+  filter(attempts >= 50)
+
+
+```
+```{r load fantasy data}
+
+#get the fantasy stats for 2019
+fantasy_stats2019 <- profootballref::gen_tables(year = 2019) 
+#cleanup the fantasy point data 
+fantasy_stats2019 <- as.data.frame(cbind(fantasy_stats2019$Player, fantasy_stats2019$FantPos, fantasy_stats2019$Fantasy_FantPt, fantasy_stats2019$Fantasy_VBD, fantasy_stats2019$Fantasy_PosRank, fantasy_stats2019$Fantasy_OvRank))
+
+#replace the special characters and spaces with blank
+fantasy_stats2019$V1 <- gsub('\\*', '', fantasy_stats2019$V1)
+fantasy_stats2019$V1 <- gsub('\\+', '', fantasy_stats2019$V1)
+fantasy_stats2019$V1 <- gsub(' ', '', fantasy_stats2019$V1)
+
+fantasy_stats2019[c("V3","V4", "V5", "V6")] <- sapply(fantasy_stats2019[c("V3","V4", "V5", "V6")], as.numeric)
+
+#rename the columns with  useful headers
+fantasy_stats2019 <- fantasy_stats2019 %>%
+  dplyr::rename(
+    Player_Name = "V1",
+    Fantasy_Position = "V2",
+    Total_Fantasy_Points = "V3",
+    Value_Over_Baseline = "V4",
+    Position_Rank = "V5",
+    Overall_Rank = "V6"
+    )
+
+```
+
+  
+We merge the two datasets on player name.
+```{r merge next-gen and fantasy data}
+
+#join the fantasy and next gen data on player name
+qb_merged_nxtgen_fantasy <- merge(next_gen_2019_qb_grouped, fantasy_stats2019, by = "Player_Name") 
+
+#replace NA's in the VBD with 0 
+qb_merged_nxtgen_fantasy$Value_Over_Baseline[is.na(qb_merged_nxtgen_fantasy$Value_Over_Baseline)] <- 0
+
+head(qb_merged_nxtgen_fantasy)
+
+```
+
+```{r exploratory data analysis - summary}
+
+#summarize the dataset
+summary(qb_merged_nxtgen_fantasy)
+
+#this gives the view of the first few rows of the highest-scoring players.
+qb_merged_nxtgen_fantasy %>% arrange(desc(Total_Fantasy_Points)) %>% head()
+
+```
+
+We'll also explore different correlations between different variables. 
+```{r correlation}
+
+#create a matrix with just numeric values, and ignore other dependent variables that are not fantasy points as that's not what we're predicting
+qb_merged_nxtgen_fantasy_matrix <- as.matrix(qb_merged_nxtgen_fantasy %>% select(avg_time_to_throw, avg_completed_air_yards, avg_intended_air_yards, avg_air_yards_differential, aggressiveness, max_completed_air_distance, avg_air_yards_to_sticks, attempts, pass_yards, pass_touchdowns, interceptions, passer_rating, completions, completion_percentage, expected_completion_percentage, avg_air_distance, max_air_distance, Total_Fantasy_Points))
+
+#create a correlation matrix based on the above matrix 
+ggcorr(qb_merged_nxtgen_fantasy_matrix, nbreaks = 10, geom = 'text', label_alpha = TRUE, angle = -15)
+
+#we look at the right column to see the following variables look to be the most correlated with Total Fantasy Points:
+##Passer_Rating
+##time_to_throw
+##avg_completed_air_yards
+##avg_intended_air_yards
+##avg_air_yards_to_sticks
+##max_air_distance
+
+#We'll plot this association between passer rating and total fantasy points just to get an idea of how one of the strongest correlations looks like, though not that strong of a linear relationship. 
+qb_merged_nxtgen_fantasy %>%
+  ggplot(aes(passer_rating, Total_Fantasy_Points)) +
+  geom_point(alpha = .5) + 
+  geom_smooth(method = 'lm')
+
+#We'll use linear regression to get a better understanding of what's needed soon. 
+
+
+```
+
+**************************************************************************************************************************
+  
+The first model we'd like to build is a Bayesian linear regression model to see the effects of the variables on overall points scored, using only variables with a positive correlation.
+
+We'll remove the variables with negative or 0 correlation to Total_Fantasy_Points (expected_completion_percentage, completions, interceptions, pass_touchdowns, pass_yards, attempts, max_completed_air_distance, aggressiveness, avg_air_yards_differential).
+
+```{r Bayes linear regression 1}
+
+mod_qb_string_1 = " model {
+
+    #likelihood
+    for (k in 1:n) {
+        Tot_Fant_Pts[k] ~ dnorm(mu[k], tau)
+        mu[k] <- b[1] + 
+        b[2]*avg_time_to_thro[k] + 
+        b[3]*avg_completed_air_yds[k] + 
+        b[4]*avg_intended_air_yds[k] + 
+        b[5]*avg_air_yds_to_sticks[k] + 
+        b[6]*pass_rating[k] +
+        b[7]*completion_percent[k] +
+        b[8]*avg_air_dist[k] +
+        b[9]*max_air_dist[k]
+    }
+    
+    #set non-informative priors on the betas
+    for (p in 1:9) {
+        b[p] ~ dnorm(0.0, 0.001)
+    }
+
+    #priors on the other non-beta parameters
+    tau ~ dgamma(0.01, 0.01) 
+    
+} "
+
+```
+
+After writing our model, we sample from it using our data, and summarize the results: 
+```{r use model qb1}
+
+#here we setup the data that will be used in the above model
+set.seed(72)
+data_qb_jags = list(Tot_Fant_Pts = qb_merged_nxtgen_fantasy$Total_Fantasy_Points,  
+                    avg_time_to_thro = qb_merged_nxtgen_fantasy$avg_time_to_throw,
+                    avg_completed_air_yds = qb_merged_nxtgen_fantasy$avg_completed_air_yards,
+                    avg_intended_air_yds = qb_merged_nxtgen_fantasy$avg_intended_air_yards,
+                    avg_air_yds_to_sticks = qb_merged_nxtgen_fantasy$avg_air_yards_to_sticks,
+                    pass_rating = qb_merged_nxtgen_fantasy$passer_rating,
+                    completion_percent = qb_merged_nxtgen_fantasy$completion_percentage,
+                    avg_air_dist = qb_merged_nxtgen_fantasy$avg_air_distance,
+                    max_air_dist = qb_merged_nxtgen_fantasy$max_air_distance
+                    , n = nrow(qb_merged_nxtgen_fantasy)
+                    )
+
+params_qb_1 = c("b")  #these are the parameters that we're trying to estimate from the model above, i.e. that we're monitoring
+
+
+#we create the model using that model string above and the data above
+mod_qb_1 = jags.model(textConnection(mod_qb_string_1), data=data_qb_jags, n.chains=3)
+update(mod_qb_1, 1000) # burn-in
+
+#we simulate the model and the parameters 5000 times
+mod_qb_1_sim = coda.samples(model=mod_qb_1,
+                       variable.names=params_qb_1,
+                       n.iter=50000)
+mod_qb_1_csim = do.call(rbind, mod_qb_1_sim)
+
+#we plot the traceplots of the different parameters
+plot(mod_qb_1_sim)
+
+#we output the summary of the model
+summary(mod_qb_1_sim)
+
+
+```
+
+
+
+**********************************************************************************************************************
+
+To do some further analysis, we'd like to scale the data so that the effect of certain variables do not overwhelm values on other variables. For example, passing yards can be on the order of 10^4, while passing touchdowns would be on the order of 10^1, so we don't want a 1 unit increase in passing yards to be treated the same as a 1 unit increase in passing touchdowns.
+
+```{r scale data}
+
+#we're going to be selecting certain variables and analyzing the effects of those variables on projected points. We have to scale the data to prevent outsized effects of certain variables. This needs to be done on the continuous (i.e. not categorical) variables
+scaled_qb <- qb_merged_nxtgen_fantasy %>% mutate_each_(funs(scale(.) %>% as.vector),
+                       vars = c('avg_time_to_throw', 'avg_completed_air_yards', 'avg_intended_air_yards', 'avg_air_yards_differential', 'aggressiveness', 'max_completed_air_distance', 'avg_air_yards_to_sticks', 'attempts', 'pass_yards', 'pass_touchdowns', 'interceptions', 'passer_rating', 'completions', 'completion_percentage', 'expected_completion_percentage', 'avg_air_distance', 'max_air_distance', 'Total_Fantasy_Points'))
+
+
+head(scaled_qb)
+```
+
+
+Now that we've scaled the data, we can use LASSO regression to select certain values based on a budget on the sum of the coefficients. LASSO is a global optimization variable selection method, that keeps the most important coefficients and drops the less important coefficients to 0 (thus removing the variable from the model). There is a more generalized version of LASSO (Elastic Net), which we'll explore here too.
+```{r variable selection}
+
+
+#prepare data to be used in glmnet, by creating a predictors matrix holding the numeric variables and a response matrix for the fantasy points
+qb_predictors <- as.matrix(scaled_qb[, 2:18])
+qb_response_fantpts <- as.matrix(scaled_qb[, 20]) %>% `colnames<-`('Total_Fantasy_Points')
+
+
+set.seed(1)
+
+#we can use elastic net to tune alpha. The closer alpha is to 1, the more it behaves like lasso regression, which tends to be better for picking variables. The closer alpha is to 1, the more it behaves like ridge regression, which tends to be better for minimizing prediction error. We'll use R^2 as the measuure of quality for each iteration.
+
+#####################
+
+#run for alpha = 0
+elastic_net_glm_0 <- cv.glmnet(x = qb_predictors, y = qb_response_fantpts, family = "gaussian", nfolds = 10, alpha = 0)
+small_lambda_index_0 <- which(elastic_net_glm_0$lambda == elastic_net_glm_0$lambda.min)
+small_lambda_betas_0 <- elastic_net_glm_0$glmnet.fit$beta[, small_lambda_index_0]
+
+
+#calculate the r-squared
+r2 <- elastic_net_glm_0$glmnet.fit$dev.ratio[which(elastic_net_glm_0$glmnet.fit$lambda == elastic_net_glm_0$lambda.min)]
+
+#add results to a dataframe
+elastic_net_results <- tibble(Alpha = '0', Rsquared = r2)
+
+
+#####################
+
+#run for alpha .25
+elastic_net_glm_0.25 <- cv.glmnet(x = qb_predictors, y = qb_response_fantpts, family = "gaussian", nfolds = 10, alpha = 0.25)
+small_lambda_index_0.25 <- which(elastic_net_glm_0.25$lambda == elastic_net_glm_0.25$lambda.min)
+small_lambda_betas_0.25 <- elastic_net_glm_0.25$glmnet.fit$beta[, small_lambda_index_0.25]
+
+#calculate the r-squared
+r2_0.25 <- elastic_net_glm_0.25$glmnet.fit$dev.ratio[which(elastic_net_glm_0.25$glmnet.fit$lambda == elastic_net_glm_0.25$lambda.min)]
+
+#create an entry in the R^2 table for this method
+elastic_net_results <- bind_rows(elastic_net_results,
+                          tibble(Alpha = '0.25', Rsquared = r2_0.25))
+
+
+#####################
+
+#run for alpha .5
+elastic_net_glm_0.5 <- cv.glmnet(x = qb_predictors, y = qb_response_fantpts, family = "gaussian", nfolds = 10, alpha = 0.5)
+small_lambda_index_0.5 <- which(elastic_net_glm_0.5$lambda == elastic_net_glm_0.5$lambda.min)
+small_lambda_betas_0.5 <- elastic_net_glm_0.5$glmnet.fit$beta[, small_lambda_index_0.5]
+
+
+#calculate the r-squared
+r2_0.5 <- elastic_net_glm_0.5$glmnet.fit$dev.ratio[which(elastic_net_glm_0.5$glmnet.fit$lambda == elastic_net_glm_0.5$lambda.min)]
+
+
+#add results to table
+elastic_net_results <- bind_rows(elastic_net_results,
+                          tibble(Alpha = '0.5', Rsquared = r2_0.5))
+
+
+#####################
+
+#run for alpha .75
+elastic_net_glm_0.75 <- cv.glmnet(x = qb_predictors, y = qb_response_fantpts, family = "gaussian", nfolds = 10, alpha = 0.75)
+small_lambda_index_0.75 <- which(elastic_net_glm_0.75$lambda == elastic_net_glm_0.75$lambda.min)
+small_lambda_betas_0.75 <- elastic_net_glm_0.75$glmnet.fit$beta[, small_lambda_index_0.75]
+
+
+#calculate the r-squared
+r2_0.75 <- elastic_net_glm_0.75$glmnet.fit$dev.ratio[which(elastic_net_glm_0.75$glmnet.fit$lambda == elastic_net_glm_0.75$lambda.min)]
+
+
+#add results to table
+elastic_net_results <- bind_rows(elastic_net_results,
+                          tibble(Alpha = '0.75', Rsquared = r2_0.75))
+
+
+####################
+
+#run for alpha 1
+elastic_net_glm_1 <- cv.glmnet(x = qb_predictors, y = qb_response_fantpts, family = "gaussian", nfolds = 10, alpha = 1)
+small_lambda_index_1 <- which(elastic_net_glm_1$lambda == elastic_net_glm_1$lambda.min)
+small_lambda_betas_1 <- elastic_net_glm_1$glmnet.fit$beta[, small_lambda_index_1]
+
+
+#calculate the r-squared
+r2_1 <- elastic_net_glm_1$glmnet.fit$dev.ratio[which(elastic_net_glm_1$glmnet.fit$lambda == elastic_net_glm_1$lambda.min)]
+
+
+#add results to table
+elastic_net_results <- bind_rows(elastic_net_results,
+                          tibble(Alpha = '1', Rsquared = r2_1))
+
+elastic_net_results %>% knitr::kable()
+
+
+#############
+#From this, we see the best R-squared is when alpha = 0. We'll output this model's coefficients:
+sort(small_lambda_betas_0)
+
+```
+
+From this, we see the best R^2 value is when alpha = 0. This is a global variable selection approach which selects which variables are most useful, subject to a constraint of how much can be allocated to each variable. Values with 0 can definitely be removed from the model. And values with values very close to 0 are practically not significant for scaled data, so can also be ignored. We'll make |.06| the threshold, considering both positive and negative factors. That leaves these variables:  
+- passer_rating  
+- avg_time_to_throw  
+- avg_completed_air_yards  
+- avg_air_yards_to_sticks  
+- max_air_distance  
+- avg_intended_air_yards
+- avg_air_distance  
+- interceptions
+
+  
+```{r Bayes linear regression}
+
+mod_qb_string_2 = " model {
+
+    #likelihood
+    for (k in 1:n) {
+        Tot_Fant_Pts[k] ~ dnorm(mu[k], tau)
+        mu[k] <- b[1] + 
+        b[2]*avg_time_to_thro[k] +
+        b[3]*avg_completed_air_yds[k] + 
+        b[4]*avg_air_yds_to_sticks[k] +
+        b[5]*avg_intended_air_yds[k] +
+        b[6]*pass_rating[k] +
+        b[7]*intercepts[k] +
+        b[8]*avg_air_dist[k] +
+        b[9]*max_air_dist[k]
+    }
+    
+    #set non-informative priors on the betas
+    for (p in 1:9) {
+        b[p] ~ dnorm(0.0, 0.001)
+    }
+
+    #priors on the other non-beta parameters
+    tau ~ dgamma(0.01, 0.01) 
+    
+} "
+
+```
+
+After writing our model, we sample from it using our data, and summarize the results: 
+```{r use model}
+
+#here we setup the data that will be used in the above model
+set.seed(72)
+data_qb_jags_2 = list(Tot_Fant_Pts = qb_merged_nxtgen_fantasy$Total_Fantasy_Points,  
+                    avg_time_to_thro = qb_merged_nxtgen_fantasy$avg_time_to_throw,
+                    avg_completed_air_yds = qb_merged_nxtgen_fantasy$avg_completed_air_yards,
+                    avg_intended_air_yds = qb_merged_nxtgen_fantasy$avg_intended_air_yards,
+                    avg_air_yds_to_sticks = qb_merged_nxtgen_fantasy$avg_air_yards_to_sticks,
+                    pass_rating = qb_merged_nxtgen_fantasy$passer_rating,
+                    completion_percent = qb_merged_nxtgen_fantasy$completion_percentage,
+                    avg_air_dist = qb_merged_nxtgen_fantasy$avg_air_distance,
+                    max_air_dist = qb_merged_nxtgen_fantasy$max_air_distance,
+                    intercepts = qb_merged_nxtgen_fantasy$interceptions
+                    , n = nrow(qb_merged_nxtgen_fantasy)
+                    )
+
+params_qb_2 = c("b")  #these are the parameters that we're trying to estimate from the model above
+
+
+#we create the model using that model string above and the data above
+mod_qb_2 = jags.model(textConnection(mod_qb_string_2), data=data_qb_jags_2, n.chains=3)
+update(mod_qb_2, 1000) # burn-in
+
+#we simulate the model and the parameters 5000 times
+mod_qb_2_sim = coda.samples(model=mod_qb_2,
+                       variable.names=params_qb_2,
+                       n.iter=50000)
+mod_qb_2_csim = do.call(rbind, mod_qb_2_sim)
+
+#we plot the traceplots of the different parameters
+plot(mod_qb_2_sim)
+
+#we output the summary of the model
+summary(mod_qb_2_sim)
+
+```
+  
+
+```{r tidybayes play}
+#using some concepts from here: https://cran.r-project.org/web/packages/tidybayes/vignettes/tidybayes.html
+#recreate the model in tidy format
+
+mod_qb_2_tidy = jags.model(textConnection(mod_qb_string_2), data=tidybayes::compose_data(data_qb_jags_2))
+
+mod_qb_2_sim_tidy = coda.samples(model=mod_qb_2_tidy,
+                       variable.names=params_qb_2,
+                       n.iter=50000)
+mod_qb_2_csim_tidy = do.call(rbind, mod_qb_2_sim_tidy)
+
+mod_qb_2_csim_tidy %>% 
+  tidybayes::recover_types(data_qb_jags_2) %>%
+  tidybayes::spread_draws(b[k]) %>%
+  head(10)
+
+mod_qb_2_csim_tidy %<>% tidybayes::recover_types(data_qb_jags_2)
+
+mod_qb_2_csim_tidy %>% 
+  tidybayes::spread_draws(b[k]) %>%
+  tidybayes::median_qi(.width = c(.95, .8, .5))
+
+mod_qb_2_csim_tidy %>% 
+  tidybayes::spread_draws(b[k]) %>%
+  #tidybayes::median_qi(.width = c(.95,.66))
+  ggplot(aes(y = fct_rev(factor(k)), x = b)) +
+  ggdist::stat_halfeye(.width = c(.90, .5)) +
+  geom_vline(xintercept = c(-10, 10)) +
+  scale_fill_manual(values = c("gray80", "skyblue"))
+  
+mod_qb_2_csim_tidy %>% 
+  tidybayes::spread_draws(b[k]) %>%
+  #tidybayes::median_qi(.width = c(.95,.66))
+  ggplot(aes(y = fct_rev(factor(k)), x = b)) +
+  ggdist::stat_dots(quantiles = 100) +
+  geom_vline(xintercept = c(-10, 10)) +
+  scale_fill_manual(values = c("gray80", "skyblue"))
+
+
+mod_qb_2_csim_tidy %>% 
+  tidybayes::gather_draws(b[k]) %>%
+  tidybayes::median_qi()
+
+lasso_results = mod_qb_2_csim_tidy %>%
+  tidybayes::spread_draws(b[k]) %>%
+  tidybayes::median_qi(estimate = b) %>%
+  tidybayes::to_broom_names() %>%
+  mutate(model = "LASSO") %>%
+  print()
+
+#bind_rows(lasso_results, first model results..., third model results,...) %>% #do similar analysis on other 1st and 3rd models in this, then use those to compare...in section Compatibility with other packages
+lasso_results %>% mutate(k = fct_rev(factor(k))) %>%
+  ggplot(aes(y = k, x = estimate, xmin = conf.low, xmax = conf.high, color = model)) +
+  ggdist::geom_pointinterval(position = position_dodge(width = .3))
+
+
+#write the linear model??
+m_linear <- lm(Total_Fantasy_Points ~ ., data = qb_merged_nxtgen_fantasy)
+
+```
+
+
+
+**********************************************************************************************************
+
+I also attempted Bayesian variable selection through Stochastic Search Variable Selection to identify which parameters are most likely to be important for the model by seeing which model is most visited by the Gibbs sampler. I did this as a learninng exercise, but it produces over 100k combinations of models because there are 17 predictors (2^17 = 131072), where the largest probability model only contained the intercept. There may be better models for when there's a larger numbers of parameters, or it needs more computational power to take more samples (which I had to reduce to 500 iterations due to it timing out with larger iterations). So I don't fully trust these results:
+```{r bayesian variable selection}
+#https://darrenjw.wordpress.com/2012/11/20/getting-started-with-bayesian-variable-selection-using-jags-and-rjags/
+
+#setup our data as the scaled qb data
+data_jags_qb_varselect =list(y=scaled_qb[,20],
+                     X=scaled_qb[,2:18],
+                     n=nrow(scaled_qb),
+                     p=ncol(scaled_qb[,2:18]))
+
+in_model_matrix_qb <- matrix(data = NA, nrow = data_jags_qb_varselect$n, data_jags_qb_varselect$p)
+
+model_3_qb_varselect_string ="
+  model {
+    for (i in 1:n) {
+      y[i]~dnorm(mean[i],tau)
+      mean[i]<-int+inprod(X[i,],beta)
+    }
+    for (j in 1:p) {
+      delta[j]~dbern(0.25) #prior probability xi is in the model
+      alpha[j]~dnorm(0,0.1)
+      beta[j]<-delta[j]*alpha[j]
+    }
+    int~dnorm(0,0.0001)
+    tau~dgamma(1,0.001)
+    #pind~dbeta(1,2)  #hyperprior on the prior probability of variable in model. beta with mean .33
+    
+    
+    #get the model sequence, where 2 means variable in the model...start small to see if it works...
+    for (j1 in 1:2){for(j2 in 1:2){for(j3 in 1:2){for(j4 in 1:2){for(j5 in 1:2){for(j6 in 1:2){for(j7 in 1:2){for(j8 in 1:2){for(j9 in 1:2){for(j10 in 1:2){for(j11 in 1:2){for(j12 in 1:2){for(j13 in 1:2){for(j14 in 1:2){for(j15 in 1:2){for(j16 in 1:2){for(j17 in 1:2){
+        in_model_matrix_qb[j1, j2, j3, j4, j5, j6, j7, j8, j9, j10, j11, j12, j13, j14, j15, j16, j17] <- ifelse(delta[1] == j1-1, 1, 0)*ifelse(delta[2] == j2-1, 1, 0)*ifelse(delta[3] == j3-1, 1, 0)*ifelse(delta[4] == j4-1, 1, 0)*ifelse(delta[5] == j5-1, 1, 0)*ifelse(delta[6] == j6-1, 1, 0)* ifelse(delta[7] == j7-1, 1, 0)* ifelse(delta[8] == j8-1, 1, 0)* ifelse(delta[9] == j9-1, 1, 0)* ifelse(delta[10] == j10-1, 1, 0)*ifelse(delta[11] == j11-1, 1, 0)*ifelse(delta[12] == j12-1, 1, 0)*ifelse(delta[13] == j13-1, 1, 0)*ifelse(delta[14] == j14-1, 1, 0)*ifelse(delta[15] == j15-1, 1, 0)*ifelse(delta[16] == j16-1, 1, 0)*ifelse(delta[17] == j17-1, 1, 0)
+    }}}}}}}}}}}}}}}}}
+   }
+"
+model_3_qb_varselect =jags.model(textConnection(model_3_qb_varselect_string),
+                data=data_jags_qb_varselect,
+                n.chains = 1)
+update(model_3_qb_varselect,n.iter=50)
+output=coda.samples(model=model_3_qb_varselect,
+        variable.names=c("delta", "in_model_matrix_qb"),
+        n.iter=500,thin=1)
+summary_qb_var_selection <- summary(output)
+#plot(output)
+
+#the means of the deltas say how often the variable was 1 (included int he model)
+```
+
+Checking the results, searching for the row with the largest mean (note the highest values are from delta, and the first model matrix combination is just the intercept, so we find the 2nd highest mean value of in_model_matrix, which has a probability of 0.088).  
+
+This isn't that high, i.e. the model just visits this model 8.8% of the time. But it's pretty sparse, so we'll use it.  
+
+This uses parameters 12 and 14 in the model (where the value is 2).
+```{r}
+
+head(sort(summary_qb_var_selection$statistics[,c('Mean')], TRUE), 10)
+#  delta[12] 
+#                                                 0.538 
+#                                             delta[14] 
+#                                                 0.287 
+#                                             delta[17] 
+#                                                 0.178 
+# in_model_matrix_qb[1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1] 
+#                                                 0.175 
+#                                             delta[13] 
+#                                                 0.119 
+#                                              delta[8] 
+#                                                 0.113 
+#                                              delta[1] 
+#                                                 0.109 
+#                                              delta[9] 
+#                                                 0.102 
+#                                             delta[11] 
+#                                                 0.092 
+# in_model_matrix_qb[1,1,1,1,1,1,1,1,1,1,1,2,1,2,1,1,1] 
+#                                                 0.088
+
+# head(sort(summary_qb_var_selection$statistics, TRUE))
+# #[1] 0.5380000 0.4988034 0.4525879 0.3827041 0.3801572 0.3239505
+# sort(summary_qb_var_selection$statistics, TRUE)[2]
+# #[1] 0.4988034
+# which(summary_qb_var_selection$statistics == sort(summary_qb_var_selection$statistics,TRUE)[2])[1]
+# #[1] 131101
+```
+
+
+We'll run the bayes regression model based on those 2 parameters + the intercept
+```{r Bayes linear reg after ssvs}
+
+mod_qb_string_3 = " model {
+
+    #likelihood
+    for (k in 1:n) {
+        Tot_Fant_Pts[k] ~ dnorm(mu[k], tau)
+        mu[k] <- b[1] + 
+        b[2]*pass_rating[k] +
+        b[3]*comp_pct[k]
+    }
+    
+    #set non-informative priors on the betas
+    for (p in 1:3) {
+        b[p] ~ dnorm(0.0, 0.001)
+    }
+
+    #priors on the other non-beta parameters
+    tau ~ dgamma(0.01, 0.01) 
+    
+} "
+
+set.seed(72)
+data_qb_jags_3 = list(Tot_Fant_Pts = qb_merged_nxtgen_fantasy$Total_Fantasy_Points,  
+                    pass_rating = qb_merged_nxtgen_fantasy$passer_rating,
+                    comp_pct = qb_merged_nxtgen_fantasy$completion_percentage,
+                    n = nrow(qb_merged_nxtgen_fantasy)
+                    )
+
+params_qb_3 = c("b")  #these are the parameters that we're trying to estimate from the model above
+
+
+#we create the model using that model string above and the data above
+mod_qb_3 = jags.model(textConnection(mod_qb_string_3), data=data_qb_jags_3, n.chains=3)
+update(mod_qb_3, 1000) # burn-in
+
+#we simulate the model and the parameters 5000 times
+mod_qb_3_sim = coda.samples(model=mod_qb_3,
+                       variable.names=params_qb_3,
+                       n.iter=50000)
+mod_qb_3_csim = do.call(rbind, mod_qb_3_sim)
+
+#we plot the traceplots of the different parameters
+plot(mod_qb_3_sim)
+
+#we output the summary of the model
+summary(mod_qb_3_sim)
+
+
+```
+Comparing the DIC's, model 2 has the lowest penalized deviance.
+```{r measure model DIC}
+
+dic_qb_mod1 <- dic.samples(mod_qb_1, n.iter = 1000)
+dic_qb_mod2 <- dic.samples(mod_qb_2, n.iter = 1000)
+dic_qb_mod3 <- dic.samples(mod_qb_3, n.iter = 1000)
+print(dic_qb_mod1)
+print(dic_qb_mod2)
+print(dic_qb_mod3)
+
+
+```

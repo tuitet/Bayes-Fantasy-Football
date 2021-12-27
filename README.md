@@ -20,7 +20,7 @@ Bayesian inference on merged dataset:
 - performing Gibbs sampling on the models to understand the relationship between explanatory variables and response variable
 - comparing models using DIC
 
-The file distribution:
+The report is composed of the below files:
 - Main PDF Written Report: Tim-Tuite-Bayes-Project-Report.pdf
 - Quarterback Statistics Inference: Tim-Tuite-Bayes-Project-QB.Rmd
 - Running Back Statistics Inference: Tim-Tuite-Bayes-Project-RB.Rmd
